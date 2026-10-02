@@ -1,0 +1,340 @@
+{
+  "name": "Rogue Protocol - Autonomous Incident Response",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "security-event",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-1-webhook",
+      "name": "Security Event Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [100, 300],
+      "webhookId": "rogue-protocol-event-inbound"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 2: Validate Event Schema\nconst body = $input.first().json.body || $input.first().json;\n\nconst required = ['event_id', 'timestamp', 'username', 'event_type', 'source_ip'];\nconst missing = required.filter(f => !body[f]);\n\nif (missing.length > 0) {\n  return [{\n    json: {\n      error: true,\n      message: `Malformed event payload. Missing required fields: ${missing.join(', ')}`,\n      status_code: 400\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    ...body,\n    validated: true,\n    ingested_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node-2-validate",
+      "name": "Validate Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [320, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 3: Check Duplicate Event\nconst event = $input.first().json;\n\n// Retrieve or initialize execution state memory\nconst staticData = $getWorkflowStaticData('global');\nstaticData.processedEventIds = staticData.processedEventIds || [];\n\nif (staticData.processedEventIds.includes(event.event_id)) {\n  return [{\n    json: {\n      is_duplicate: true,\n      event_id: event.event_id,\n      message: 'Duplicate event ID detected. Skipped redundant processing.'\n    }\n  }];\n}\n\n// Record ID to prevent duplicate processing\nstaticData.processedEventIds.push(event.event_id);\nif (staticData.processedEventIds.length > 500) {\n  staticData.processedEventIds.shift();\n}\n\nreturn [{\n  json: {\n    ...event,\n    is_duplicate: false\n  }\n}];"
+      },
+      "id": "node-3-check-dup",
+      "name": "Check Duplicate Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [540, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 4: Store Event in local memory / Google Sheets queue\nconst event = $input.first().json;\nconst staticData = $getWorkflowStaticData('global');\nstaticData.eventLog = staticData.eventLog || [];\n\nstaticData.eventLog.push(event);\nif (staticData.eventLog.length > 200) {\n  staticData.eventLog.shift();\n}\n\nreturn [{ json: event }];"
+      },
+      "id": "node-4-store-event",
+      "name": "Store Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [760, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 5: Fetch Recent User Events within 30-minute correlation window\nconst currentEvent = $input.first().json;\nconst staticData = $getWorkflowStaticData('global');\nconst eventLog = staticData.eventLog || [currentEvent];\n\nconst now = new Date(currentEvent.timestamp || new Date()).getTime();\nconst windowMs = 30 * 60 * 1000; // 30 minutes\n\nconst userEvents = eventLog.filter(e => \n  e.username === currentEvent.username &&\n  (now - new Date(e.timestamp).getTime()) <= windowMs\n);\n\nreturn [{\n  json: {\n    current_event: currentEvent,\n    correlated_events: userEvents.length > 0 ? userEvents : [currentEvent],\n    user: currentEvent.username,\n    event_count: userEvents.length || 1\n  }\n}];"
+      },
+      "id": "node-5-fetch-recent",
+      "name": "Fetch Recent User Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [980, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 6: Correlate Events and prepare prompt for Google Gemini\nconst data = $input.first().json;\nconst events = data.correlated_events;\n\nconst prompt = `You are the Rogue Protocol Autonomous AI Security Incident Response Agent.\nAnalyze the following simulated security events for user: ${data.user}.\n\nRules:\n1. Analyze only the supplied simulated events. Do not invent missing facts.\n2. Distinguish observed facts from assumptions.\n3. Explain why events may be related temporally or operationally.\n4. Assign severity based strictly on evidence (LOW, MEDIUM, HIGH, CRITICAL).\n5. Recommend safe, simulated containment steps.\n6. Do not claim certainty; use wording like \"potential incident\" and \"requires investigation\".\n7. Return VALID JSON ONLY conforming to the required schema.\n\nEvents Observed:\n${JSON.stringify(events, null, 2)}\n\nRequired JSON format:\n{\n  \"incident_detected\": boolean,\n  \"incident_type\": string,\n  \"title\": string,\n  \"severity\": \"LOW\" | \"MEDIUM\" | \"HIGH\" | \"CRITICAL\",\n  \"confidence\": number,\n  \"summary\": string,\n  \"observed_facts\": string[],\n  \"reasoning\": string,\n  \"recommended_actions\": [\n    {\n      \"action\": string,\n      \"risk\": \"low\" | \"medium\" | \"high\",\n      \"requires_approval\": boolean\n    }\n  ],\n  \"requires_human_review\": boolean\n}`;\n\nreturn [{\n  json: {\n    ...data,\n    analysis_prompt: prompt\n  }\n}];"
+      },
+      "id": "node-6-correlate",
+      "name": "Correlate Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={{$env.GEMINI_API_KEY}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"contents\": [\n    {\n      \"parts\": [\n        {\n          \"text\": {{$json.analysis_prompt}}\n        }\n      ]\n    }\n  ],\n  \"generationConfig\": {\n    \"responseMimeType\": \"application/json\",\n    \"temperature\": 0.2\n  }\n}",
+        "options": {}
+      },
+      "id": "node-7-gemini",
+      "name": "Gemini Incident Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1420, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 8: Validate and Parse AI JSON\nconst item = $input.first().json;\n\ntry {\n  let rawText = '';\n  if (item.candidates && item.candidates[0]?.content?.parts[0]?.text) {\n    rawText = item.candidates[0].content.parts[0].text;\n  } else if (item.response) {\n    rawText = item.response;\n  }\n\n  let parsed = {};\n  if (rawText) {\n    parsed = JSON.parse(rawText);\n  } else {\n    // Fallback deterministic analysis if Gemini key not set\n    const types = (item.correlated_events || []).map(e => e.event_type);\n    const isTakeover = types.includes('large_download') || (types.includes('password_changed') && types.includes('user_reported'));\n    const isSuspicious = types.filter(t => t === 'login_failed').length >= 2;\n\n    if (isTakeover) {\n      parsed = {\n        incident_detected: true,\n        incident_type: 'possible_account_compromise',\n        title: 'Possible Account Compromise & Bulk Exfiltration',\n        severity: 'HIGH',\n        confidence: 0.92,\n        summary: 'Correlated brute-force, anomalous login, credential change, and mass download.',\n        observed_facts: ['Consecutive failed logins', 'Foreign IP login', 'Password reset', 'Archive download'],\n        reasoning: 'Temporal sequence indicates full account compromise pattern.',\n        recommended_actions: [\n          { action: 'Simulate temporary account suspension', risk: 'high', requires_approval: true },\n          { action: 'Simulate edge firewall null-route for source IP', risk: 'medium', requires_approval: true },\n          { action: 'Archive telemetry to forensic log', risk: 'low', requires_approval: false }\n        ],\n        requires_human_review: true\n      };\n    } else if (isSuspicious) {\n      parsed = {\n        incident_detected: true,\n        incident_type: 'suspicious_login_activity',\n        title: 'Suspicious Authentication Sequence',\n        severity: 'MEDIUM',\n        confidence: 0.82,\n        summary: 'Repeated authentication failures followed by login from unexpected IP.',\n        observed_facts: ['Repeated password rejections', 'Immediate subsequent success'],\n        reasoning: 'Possible credential guessing attempt.',\n        recommended_actions: [\n          { action: 'Simulate step-up MFA challenge requirement', risk: 'medium', requires_approval: true },\n          { action: 'Log behavioral baseline shift', risk: 'low', requires_approval: false }\n        ],\n        requires_human_review: false\n      };\n    } else {\n      parsed = {\n        incident_detected: false,\n        summary: 'Routine legitimate activity.',\n        severity: 'LOW',\n        confidence: 0.99\n      };\n    }\n  }\n\n  return [{\n    json: {\n      ...item,\n      ai_analysis: parsed,\n      valid_ai_json: true\n    }\n  }];\n} catch (e) {\n  return [{\n    json: {\n      ...item,\n      valid_ai_json: false,\n      parse_error: e.message\n    }\n  }];\n}"
+      },
+      "id": "node-8-validate-json",
+      "name": "Validate AI JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 9: Apply Deterministic Safety Rules\nconst item = $input.first().json;\nconst analysis = item.ai_analysis;\n\n// Rule 1: High & Critical ALWAYS require human review\nif (analysis.severity === 'HIGH' || analysis.severity === 'CRITICAL') {\n  analysis.requires_human_review = true;\n}\n\n// Rule 2: Any action altering access or credentials requires approval\nif (analysis.recommended_actions) {\n  analysis.recommended_actions = analysis.recommended_actions.map(act => {\n    const sensitiveTerms = ['suspend', 'disable', 'block', 'revoke', 'freeze', 'restrict', 'reset', 'password'];\n    const isSensitive = sensitiveTerms.some(term => act.action.toLowerCase().includes(term));\n    return {\n      ...act,\n      requires_approval: act.requires_approval || isSensitive\n    };\n  });\n}\n\nreturn [{\n  json: {\n    ...item,\n    ai_analysis: analysis,\n    safety_rules_applied: true\n  }\n}];"
+      },
+      "id": "node-9-safety-rules",
+      "name": "Apply Safety Rules",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1860, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.ai_analysis.incident_detected}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node-10-is-incident",
+      "name": "Incident Detected?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2080, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 11: Create or Update Incident\nconst item = $input.first().json;\nconst analysis = item.ai_analysis;\nconst user = item.user;\nconst correlated = item.correlated_events || [];\n\nconst incidentId = `INC-${new Date().getFullYear()}-${Math.floor(100 + Math.random() * 900)}`;\n\nconst incident = {\n  incident_id: incidentId,\n  title: analysis.title || 'Potential Security Incident',\n  incident_type: analysis.incident_type || 'unclassified',\n  severity: analysis.severity || 'MEDIUM',\n  confidence: analysis.confidence || 0.85,\n  status: 'ACTION_REQUIRED',\n  affected_user: user,\n  summary: analysis.summary,\n  observed_facts: analysis.observed_facts || [],\n  reasoning: analysis.reasoning || '',\n  event_ids: correlated.map(e => e.event_id),\n  recommended_actions: analysis.recommended_actions || [],\n  created_at: new Date().toISOString(),\n  updated_at: new Date().toISOString(),\n  is_simulated: true\n};\n\nreturn [{\n  json: {\n    ...item,\n    incident\n  }\n}];"
+      },
+      "id": "node-11-create-incident",
+      "name": "Create or Update Incident",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2300, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 12: Create Approval Requests for sensitive actions\nconst item = $input.first().json;\nconst incident = item.incident;\n\nconst approvals = (incident.recommended_actions || [])\n  .filter(a => a.requires_approval)\n  .map((a, idx) => ({\n    approval_id: `APP-${Date.now()}-${idx + 1}`,\n    incident_id: incident.incident_id,\n    action: a.action,\n    reason: `Containment action recommended for ${incident.severity} incident.`,\n    impact: `Simulated containment for ${incident.affected_user}. Safe demo only.`,\n    status: 'PENDING',\n    requested_at: new Date().toISOString()\n  }));\n\nreturn [{\n  json: {\n    ...item,\n    approvals\n  }\n}];"
+      },
+      "id": "node-12-create-approval",
+      "name": "Create Approval Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2520, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 13: Send Alert / Honest Preview Fallback\nconst item = $input.first().json;\nconst incident = item.incident;\n\nconst notification = {\n  recipient: 'soc-team@fictional-corp.internal',\n  subject: `[${incident.severity} ALERT] Rogue Protocol: Potential Incident ${incident.incident_id}`,\n  body: `Rogue Protocol AI Response Agent has detected a potential ${incident.severity} incident for ${incident.affected_user}.\\n\\nSummary: ${incident.summary}\\n\\nHuman authorization is required for simulated containment.`,\n  timestamp: new Date().toISOString(),\n  is_preview_fallback: true\n};\n\nreturn [{\n  json: {\n    ...item,\n    notification\n  }\n}];"
+      },
+      "id": "node-13-gmail-alert",
+      "name": "Send Gmail Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2740, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 14: Write Audit Log\nconst item = $input.first().json;\nconst incident = item.incident;\n\nconst log = {\n  log_id: `AUD-${Date.now()}`,\n  timestamp: new Date().toISOString(),\n  action_type: 'INCIDENT_CREATED',\n  description: `n8n workflow created incident ${incident?.incident_id || 'N/A'} with severity ${incident?.severity || 'LOW'}`,\n  operator: 'n8n Automation Pipeline',\n  details: { incident_id: incident?.incident_id }\n};\n\nreturn [{\n  json: {\n    ...item,\n    audit_log: log\n  }\n}];"
+      },
+      "id": "node-14-audit-log",
+      "name": "Write Audit Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2960, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"success\",\n  \"event_received\": true,\n  \"incident_detected\": {{$json.ai_analysis.incident_detected || false}},\n  \"incident\": {{$json.incident || null}},\n  \"approvals\": {{$json.approvals || []}},\n  \"notification\": {{$json.notification || null}}\n}",
+        "options": {}
+      },
+      "id": "node-15-respond-webhook",
+      "name": "Return Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3180, 300]
+    }
+  ],
+  "connections": {
+    "Security Event Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Event": {
+      "main": [
+        [
+          {
+            "node": "Check Duplicate Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Duplicate Event": {
+      "main": [
+        [
+          {
+            "node": "Store Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Event": {
+      "main": [
+        [
+          {
+            "node": "Fetch Recent User Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Recent User Events": {
+      "main": [
+        [
+          {
+            "node": "Correlate Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Correlate Events": {
+      "main": [
+        [
+          {
+            "node": "Gemini Incident Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Incident Analysis": {
+      "main": [
+        [
+          {
+            "node": "Validate AI JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate AI JSON": {
+      "main": [
+        [
+          {
+            "node": "Apply Safety Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Safety Rules": {
+      "main": [
+        [
+          {
+            "node": "Incident Detected?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Incident Detected?": {
+      "main": [
+        [
+          {
+            "node": "Create or Update Incident",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Write Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create or Update Incident": {
+      "main": [
+        [
+          {
+            "node": "Create Approval Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Approval Request": {
+      "main": [
+        [
+          {
+            "node": "Send Gmail Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Gmail Alert": {
+      "main": [
+        [
+          {
+            "node": "Write Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Audit Log": {
+      "main": [
+        [
+          {
+            "node": "Return Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
